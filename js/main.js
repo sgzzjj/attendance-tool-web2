@@ -397,6 +397,15 @@ function normalizeTime(str) {
   return String(str).replace(/[\uFF1A]/g, ':').replace(/[\uFF0D]/g, '-').trim();
 }
 
+// 将时间统一规范为 HH:MM，避免 Excel h:mm（如 8:15）与文本 08:15 不匹配
+function padTime(str) {
+  const t = normalizeTime(str);
+  if (!t) return '';
+  const m = t.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  if (!m) return t;
+  return `${String(parseInt(m[1], 10)).padStart(2, '0')}:${m[2]}`;
+}
+
 function normalizeDate(str) {
   if (str === undefined || str === null) return '';
   let s = String(str).trim();
@@ -686,21 +695,25 @@ function processAbnormalWorkbook(parsed) {
       });
       rec['班组'] = rec['科室'] || '';
       rec['处置状态'] = '待处理';
-      records.push(rec);
 
       // 匹配校验：按 工号 + 姓名 + 开始日期 在合并大表中定位
       const empNo = String(rec['工号'] || '').trim();
       const empName = rec['姓名'] || '';
       const startDate = rec['开始日期'];
       const matched = appState.mergedRecords.find(r => {
-        const sameEmp = String(r['工号']).trim() === empNo && r['姓名'] === empName;
+        const sameEmp = String(r['工号']).trim() === empNo && String(r['姓名'] || '').trim() === String(empName).trim();
         if (!sameEmp) return false;
         const recDate = toYYYYMMDD(startDate);
         const recStart = String(rec['开始时间'] || '').trim();
         const matchDate = r['加班开始日期'] === recDate || r['加班开始日期'] === startDate || toYYYYMMDD(r['加班开始日期']) === recDate;
-        const matchTime = !recStart || r['加班开始时间'] === recStart;
+        const matchTime = !recStart || padTime(r['加班开始时间']) === padTime(recStart);
         return matchDate && matchTime;
       });
+
+      // 标记匹配结果：未匹配记录不进入整改表
+      rec['匹配状态'] = matched ? '已匹配' : '未匹配';
+      if (matched) rec['系统序号'] = matched['系统序号'];
+      records.push(rec);
 
       if (!matched) {
         failures.push({
@@ -737,11 +750,15 @@ function processRectifyWorkbook(parsed) {
       return rec;
     });
     objs.forEach(obj => {
-      const type = String(obj['处置方式'] || '不处理').trim();
+      const type = String(obj['处置方式'] || '').trim();
       let detail = '';
       let opType = type;
 
-      if (type === '修改') {
+      if (!type) {
+        // 未填写处置方式：标记为未填写，提示用户补充，不参与批量执行
+        opType = '未填写';
+        detail = '未填写处置方式，请在整改表中填写后重新导入';
+      } else if (type === '修改') {
         detail = `修改后：${obj['修改后开始日期']} ${normalizeTime(obj['修改后开始时间'])}-${normalizeTime(obj['修改后结束时间'])}，${obj['修改后上报加班时数']}h`;
       } else if (type === '删除') {
         detail = '从合并大表中删除该记录';
@@ -1146,13 +1163,14 @@ function renderRectify() {
   const round = getCurrentRound();
   const operations = appState.rectifyOperations.length ? appState.rectifyOperations : demoOperations;
   const hasFile = !!appState.rectifyWorkbook;
-  const stats = { 修改: 0, 删除: 0, 调班: 0, 特殊情况: 0 };
+  const stats = { 修改: 0, 删除: 0, 调班: 0, 特殊情况: 0, 未填写: 0 };
   operations.forEach(op => {
     const t = op['操作类型'];
     if (t === '修改') stats['修改']++;
     else if (t === '删除') stats['删除']++;
     else if (t === '调班') stats['调班']++;
     else if (t === '特殊情况') stats['特殊情况']++;
+    else if (t === '未填写') stats['未填写']++;
   });
 
   return `
@@ -1191,6 +1209,15 @@ function renderRectify() {
               <span>无需同步导入合并大表，系统会自动按 ID 定位。</span>
             </div>
           </div>
+
+          ${stats['未填写'] > 0 ? `
+            <div class="mt-4 p-4 rounded-2xl bg-apple-red/5 border border-apple-red/20">
+              <div class="flex items-start gap-2 text-sm text-apple-red">
+                <i class="ph ph-warning-circle mt-0.5"></i>
+                <span>有 ${stats['未填写']} 条记录未填写处置方式，请在整改表中补充填写后重新导入，否则无法执行批量操作。</span>
+              </div>
+            </div>
+          ` : ''}
         </div>
 
         <div class="bg-apple-card rounded-3xl p-8 shadow-card">
@@ -1211,6 +1238,10 @@ function renderRectify() {
             <div class="p-4 rounded-2xl bg-apple-gray/50 text-center">
               <div class="text-2xl font-semibold">${stats['特殊情况']}</div>
               <div class="text-xs text-apple-muted mt-1">特殊情况</div>
+            </div>
+            <div class="p-4 rounded-2xl ${stats['未填写'] > 0 ? 'bg-apple-red/10' : 'bg-apple-gray/50'} text-center">
+              <div class="text-2xl font-semibold ${stats['未填写'] > 0 ? 'text-apple-red' : ''}">${stats['未填写']}</div>
+              <div class="text-xs ${stats['未填写'] > 0 ? 'text-apple-red' : 'text-apple-muted'} mt-1">未填写</div>
             </div>
           </div>
         </div>
@@ -1523,6 +1554,13 @@ function confirmBatch() {
   const round = getCurrentRound();
   const ops = appState.rectifyOperations.length ? appState.rectifyOperations : demoOperations;
 
+  // 存在未填写处置方式的记录时，阻止执行并提示补充
+  const unfilled = ops.filter(o => o['操作类型'] === '未填写').length;
+  if (unfilled > 0) {
+    showToast(`有 ${unfilled} 条记录未填写处置方式，请补充填写后重新导入整改表`, 'error');
+    return;
+  }
+
   // 执行实际的批量操作：修改/删除/调班
   applyBatchOperations(ops);
 
@@ -1726,7 +1764,13 @@ function exportMergedAndContinue() {
 }
 
 function exportRectify() {
-  const records = appState.abnormalRecords.length ? appState.abnormalRecords : demoAbnormal;
+  const allRecords = appState.abnormalRecords.length ? appState.abnormalRecords : demoAbnormal;
+  // 匹配失败的记录没有对应系统序号，无法执行整改，不进入整改表
+  const records = allRecords.filter(r => r['匹配状态'] !== '未匹配');
+  const excluded = allRecords.length - records.length;
+  if (excluded > 0) {
+    showToast(`已排除 ${excluded} 条匹配失败记录，整改表仅包含匹配成功的记录`, 'warning');
+  }
   // 按班组/科室分组
   const groups = {};
   records.forEach(r => {
@@ -1740,6 +1784,8 @@ function exportRectify() {
   Object.keys(groups).forEach(group => {
     const rows = groups[group].map(r => {
       return headers.map(h => {
+        // ID 列写入合并大表的系统序号，确保整改回传后能按系统序号正确定位
+        if (h === 'ID') return r['系统序号'] !== undefined ? r['系统序号'] : (r['ID'] !== undefined ? r['ID'] : '');
         if (ABNORMAL_HEADERS.includes(h)) return r[h] !== undefined ? r[h] : '';
         return '';
       });
@@ -1972,6 +2018,7 @@ function showToast(message, type = 'info') {
   const colors = {
     success: 'bg-apple-green text-white',
     error: 'bg-apple-red text-white',
+    warning: 'bg-apple-orange text-white',
     info: 'bg-apple-blue text-white',
   };
   toast.className = `fixed bottom-8 right-8 px-6 py-3 rounded-2xl shadow-lg text-sm font-medium z-50 ${colors[type] || colors.info} animate-[fadeIn_0.3s_ease-out]`;
